@@ -1,0 +1,168 @@
+!pip install openai numpy requests
+!pip install anthropic
+
+import os
+import csv
+import json
+import requests
+
+# ✅ File paths
+CSV_PATH = r'C:\Users\HarshTyagi\Downloads\cbp_descriptions.csv'
+INPUT_CSV = r'C:\Users\HarshTyagi\Downloads\input.csv'
+OUTPUT_CSV = r'C:\Users\HarshTyagi\Desktop\output.csv'
+KB_CSV = r'C:\Users\HarshTyagi\Desktop\knowledge_base.csv'  # 🧠 Knowledge base
+
+# ✅ Claude configuration
+CLAUDE_API_URL = 'https://api.anthropic.com/v1/messages'
+CLAUDE_API_KEY = os.getenv('CLAUDE_API_KEY', 'XXXXX')
+
+def init_csv():
+    # Init cbp_descriptions
+    if not os.path.exists(CSV_PATH):
+        with open(CSV_PATH, 'w', newline='', encoding='utf-8') as csvfile:
+            fieldnames = ['id', 'original_description', 'suggested_description', 'accepted_description', 'embedding']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+    # Init knowledge_base
+    if not os.path.exists(KB_CSV):
+        with open(KB_CSV, 'w', newline='', encoding='utf-8') as kbfile:
+            fieldnames = ['original_description', 'suggested_description']
+            writer = csv.DictWriter(kbfile, fieldnames=fieldnames)
+            writer.writeheader()
+
+def get_next_id():
+    try:
+        with open(CSV_PATH, newline='', encoding='utf-8') as csvfile:
+            reader = csv.DictReader(csvfile)
+            ids = [int(row['id']) for row in reader if row['id']]
+            return max(ids) + 1 if ids else 1
+    except FileNotFoundError:
+        return 1
+
+def get_claude_summary(description):
+    prompt = f"""
+You are helping create CBP-compliant product descriptions.
+A CBP compliant product description should be accurate, detailed, and specific, including the product's name, what it's made of, and its intended use
+You’ve been trained on examples from cbp_descriptions.csv and knowledge_base.csv.
+
+Guidelines:
+- Input descriptions may include personal names, invoice numbers, or payers.
+- Your goal is to summarize the **product name,Material,Color,type only**, keeping it accurate and compliant.
+- Omit any invoice numbers, names, or non-product info.
+- Limit to **under 65 characters**.
+- Use product language that CBP would accept (no vague or marketing terms).
+
+Examples:
+
+Input: Midnight Garden Print Kurti Gharara Set (ARTHI SRINIVASAN) INV-10574
+Output: Midnight Garden Kurti Gharara Set
+
+Input: Ivory Floral Embroidered Gown with Scarf (Anita Kumar) INV-9988
+Output: Ivory Floral Embroidered Gown
+
+Input: Rafflesia Garden Print Pre-Draped Ruffle Tiered Saree With Blouse (Michele Mulroy) INV-17406
+Output: Rafflesia Ruffle Tiered Saree Set
+
+Now summarize the following input to be CBP-compliant and under 65 characters:
+
+{description}
+
+Summary:
+"""
+
+
+    headers = {
+        'x-api-key': CLAUDE_API_KEY,
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json',
+    }
+
+    data = {
+        "model": "claude-3-opus-20240229",
+        "max_tokens": 100,
+        "messages": [
+            {"role": "user", "content": prompt}
+        ]
+    }
+
+    try:
+        response = requests.post(CLAUDE_API_URL, headers=headers, json=data, timeout=30)
+        response.raise_for_status()
+        result = response.json()
+        summary = result['content'][0]['text'].strip()
+        if len(summary) > 65:
+            summary = summary[:62] + '...'
+        return summary
+    except Exception as e:
+        print(f"Error calling Claude API: {e}")
+        return ''
+
+def batch_process():
+    init_csv()
+
+    if not os.path.exists(INPUT_CSV):
+        print(f"❌ Input file not found at: {INPUT_CSV}")
+        return
+
+    with open(INPUT_CSV, newline='', encoding='utf-8') as infile, \
+         open(OUTPUT_CSV, 'w', newline='', encoding='utf-8') as outfile:
+        reader = csv.DictReader(infile)
+        fieldnames = ['original_description', 'suggested_description', 'accepted_description']
+        writer = csv.DictWriter(outfile, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for row in reader:
+            desc = row['description']
+            summary = get_claude_summary(desc)
+
+            # Insert into main database CSV
+            next_id = get_next_id()
+            with open(CSV_PATH, 'a', newline='', encoding='utf-8') as dbfile:
+                db_fieldnames = ['id', 'original_description', 'suggested_description', 'accepted_description', 'embedding']
+                db_writer = csv.DictWriter(dbfile, fieldnames=db_fieldnames)
+                db_writer.writerow({
+                    'id': next_id,
+                    'original_description': desc,
+                    'suggested_description': summary,
+                    'accepted_description': '',
+                    'embedding': ''
+                })
+
+            # Write to output file
+            writer.writerow({
+                'original_description': desc,
+                'suggested_description': summary,
+                'accepted_description': ''
+            })
+
+    print(f"✅ Batch processing complete. Results saved to:\n{OUTPUT_CSV}")
+
+def update_knowledge_base():
+    if not os.path.exists(OUTPUT_CSV):
+        print(f"❌ Output file not found: {OUTPUT_CSV}")
+        return
+
+    with open(OUTPUT_CSV, newline='', encoding='utf-8') as infile:
+        reader = csv.DictReader(infile)
+        new_rows = [
+            {
+                'original_description': row['original_description'],
+                'suggested_description': row['suggested_description']
+            }
+            for row in reader if row.get('accepted_description', '').strip() == '1'
+        ]
+
+    if not new_rows:
+        print("ℹ️ No new accepted rows to update in knowledge base.")
+        return
+
+    with open(KB_CSV, 'a', newline='', encoding='utf-8') as outfile:
+        writer = csv.DictWriter(outfile, fieldnames=['original_description', 'suggested_description'])
+        writer.writerows(new_rows)
+
+    print(f"✅ Knowledge base updated with {len(new_rows)} new entries.")
+
+
+if __name__ == "__main__":
+    update_knowledge_base()   # ✅ First extract accepted data from old output
+    batch_process()           # ✅ Then overwrite output with new input summaries
