@@ -1,0 +1,240 @@
+!pip install selenium beautifulsoup4 pandas openpyxl webdriver-manager
+
+import os
+import re
+import time
+from urllib.parse import urljoin
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, StaleElementReferenceException
+from bs4 import BeautifulSoup
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Alignment
+
+# === CONFIG ===
+EXCEL_PATH = r"C:\Users\HarshTyagi\Desktop\Knowledge Base\toyfort_all_products.xlsx"
+BASE_DOMAIN = "https://toyfort.in"
+CATEGORIES_TO_KEEP = ("toy", "school")  # substring match (case-insensitive)
+WAIT_SECONDS = 12
+
+# === Prepare workbook ===
+if not os.path.exists(EXCEL_PATH):
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Products"
+    ws.append(["Category", "Product Name", "Price", "Rating", "Description", "Image URL", "Product URL"])
+    # set some reasonable column widths for readability
+    ws.column_dimensions['A'].width = 20
+    ws.column_dimensions['B'].width = 40
+    ws.column_dimensions['C'].width = 14
+    ws.column_dimensions['D'].width = 10
+    ws.column_dimensions['E'].width = 80
+    ws.column_dimensions['F'].width = 60
+    ws.column_dimensions['G'].width = 60
+    wb.save(EXCEL_PATH)
+
+wb = load_workbook(EXCEL_PATH)
+ws = wb.active
+
+# load already-scraped product urls to avoid duplicates
+existing_urls = set()
+for row in ws.iter_rows(min_row=2, values_only=True):
+    if row and row[-1]:
+        existing_urls.add(row[-1])
+
+print(f"🔁 Already scraped: {len(existing_urls)} products")
+
+# === Selenium setup ===
+options = Options()
+options.add_argument("--start-maximized")
+# options.add_argument("--headless")  # uncomment if you want headless
+service = Service()  # if chromedriver not on PATH, use Service(executable_path="C:/path/to/chromedriver.exe")
+driver = webdriver.Chrome(service=service, options=options)
+wait = WebDriverWait(driver, WAIT_SECONDS)
+
+# helper functions
+def is_desired_category(name):
+    if not name:
+        return False
+    lname = name.lower()
+    return any(k in lname for k in CATEGORIES_TO_KEEP)
+
+def clean_description_single_line(text):
+    if not text:
+        return "N/A"
+    # replace all whitespace (including newlines, tabs) with single spaces and trim
+    text = re.sub(r"\s+", " ", text).strip()
+    # remove repeated spaces
+    text = re.sub(r" {2,}", " ", text)
+    return text if text else "N/A"
+
+# open homepage
+driver.get(BASE_DOMAIN)
+time.sleep(2)
+
+# close popup if present
+try:
+    close_btn = driver.find_element(By.CSS_SELECTOR, ".popup-close")
+    close_btn.click()
+    print("✅ Popup closed")
+except NoSuchElementException:
+    print("✅ No popup detected")
+
+# build category list from homepage markup
+page_soup = BeautifulSoup(driver.page_source, "html.parser")
+cat_links = []
+
+# first try the nav-link pattern (common in this site)
+for el in page_soup.select(".nav-link[data-id][data-parent-id='0']"):
+    txt = el.get_text(" ", strip=True)
+    href = el.get("href") or el.get("data-href") or ""
+    if not href:
+        href = el.get("data-href") or ""
+    cat_links.append((txt, urljoin(BASE_DOMAIN, href)))
+
+# fallback: generic header nav anchors
+if not cat_links:
+    for a in page_soup.select("nav a"):
+        txt = a.get_text(" ", strip=True)
+        href = a.get("href") or ""
+        cat_links.append((txt, urljoin(BASE_DOMAIN, href)))
+
+# filter only toy & school categories
+desired_categories = [(t, h) for (t, h) in cat_links if is_desired_category(t)]
+print(f"✅ Found {len(desired_categories)} matching categories: {[t for t,_ in desired_categories]}")
+
+if not desired_categories:
+    print("⚠️ No categories matched 'toy' or 'school'. You may need to inspect the homepage markup or adjust CATEGORIES_TO_KEEP.")
+else:
+    # iterate desired categories
+    for cat_name, cat_href in desired_categories:
+        try:
+            print(f"\n🔎 Category: {cat_name} -> {cat_href}")
+            driver.get(cat_href)
+            time.sleep(2)
+
+            while True:
+                # wait for products to appear on the page
+                try:
+                    wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, ".product-item")))
+                except TimeoutException:
+                    print(f"⚠️ No products loaded for {cat_name}")
+                    break
+
+                soup = BeautifulSoup(driver.page_source, "html.parser")
+
+                # collect product links from page
+                product_links = []
+                for img in soup.select(".product-item .img-product"):
+                    parent_a = img if img.name == "a" else img.find_parent("a")
+                    if parent_a and parent_a.get("href"):
+                        product_links.append(urljoin(BASE_DOMAIN, parent_a["href"].strip()))
+                # preserve order and keep unique
+                product_links = list(dict.fromkeys(product_links))
+                print(f"   📄 Found {len(product_links)} products on this page")
+
+                for product_url in product_links:
+                    if product_url in existing_urls:
+                        print(f"      ⏩ Skipping already scraped: {product_url}")
+                        continue
+
+                    try:
+                        driver.get(product_url)
+                        # small wait for product page JS to render
+                        time.sleep(1.2)
+                        psoup = BeautifulSoup(driver.page_source, "html.parser")
+
+                        name = psoup.select_one("h1").text.strip() if psoup.select_one("h1") else "N/A"
+
+                        price_elem = psoup.select_one("b.discount-original-price")
+                        if price_elem:
+                            raw_price = price_elem.get_text(strip=True).replace('₹', '').replace(',', '')
+                            price = f"₹{raw_price}" if raw_price else "N/A"
+                        else:
+                            price = "N/A"
+
+                        # ===== DESCRIPTION: use the exact element the user specified =====
+                        desc_el = psoup.select_one("#collapse_description_content .description")
+                        if desc_el:
+                            # get text with spaces (no newlines), then collapse whitespace to single spaces
+                            raw_description = desc_el.get_text(" ", strip=True)
+                        else:
+                            # fallback: other description selectors
+                            fallback = psoup.select_one(".product-description")
+                            raw_description = fallback.get_text(" ", strip=True) if fallback else "N/A"
+
+                        description = clean_description_single_line(raw_description)
+
+                        # image extraction (try slider image or standard product image)
+                        image_elem = psoup.select_one("img.img-product-slider") or psoup.select_one(".product-image img") or psoup.select_one("img")
+                        image_url = urljoin(BASE_DOMAIN, image_elem['src'].strip()) if image_elem and image_elem.get('src') else "N/A"
+
+                        # rating extraction if present via style width percentage
+                        rating_elem = psoup.select_one(".product-rating .star-content")
+                        if rating_elem and rating_elem.get("style"):
+                            style = rating_elem.get("style")
+                            try:
+                                rating = round(float(style.split(":")[1].replace("%", "").strip()) / 20, 1)
+                            except Exception:
+                                rating = "N/A"
+                        else:
+                            rating = "N/A"
+
+                        # append and set wrapText False so it stays single-line visually
+                        ws.append([cat_name, name, price, rating, description, image_url, product_url])
+                        row_idx = ws.max_row
+                        desc_cell = ws.cell(row=row_idx, column=5)  # Description column E
+                        desc_cell.alignment = Alignment(wrapText=False)
+
+                        wb.save(EXCEL_PATH)
+                        existing_urls.add(product_url)
+                        print(f"      ✔ Wrote: {name}")
+
+                    except Exception as e:
+                        print(f"⚠️ Error scraping {product_url}: {e}")
+
+                # --- pagination: find <ul class="pagination"> and the next <li> after li.active ---
+                nav = soup.select_one("ul.pagination")
+                if not nav:
+                    print(f"   ✅ No pagination for {cat_name}, finished category")
+                    break
+
+                active_li = nav.select_one("li.active")
+                next_li = active_li.find_next_sibling("li") if active_li else None
+
+                if next_li:
+                    next_a = next_li.find("a")
+                    if next_a and next_a.get("href"):
+                        next_page = urljoin(BASE_DOMAIN, next_a["href"].strip())
+                        print(f"   🔁 Navigating to next page: {next_page}")
+                        driver.get(next_page)
+                        time.sleep(2)
+                        continue
+                    else:
+                        print(f"   ✅ Reached last page for {cat_name}")
+                        break
+                else:
+                    # fallback: try to find chevron links '›' or '»'
+                    next_anchor = None
+                    for a in nav.select("a"):
+                        if a.get_text(strip=True) in ("›", "»"):
+                            next_anchor = a
+                            break
+                    if next_anchor and next_anchor.get("href"):
+                        next_page = urljoin(BASE_DOMAIN, next_anchor["href"].strip())
+                        print(f"   🔁 Navigating to (chevron) page: {next_page}")
+                        driver.get(next_page)
+                        time.sleep(2)
+                        continue
+                    print(f"   ✅ No next page found for {cat_name}, finished")
+                    break
+
+        except Exception as e:
+            print(f"⚠️ Error in category {cat_name}: {e}")
+
+driver.quit()
+print(f"\n🎯 Scraping complete! Data saved to {EXCEL_PATH}")
