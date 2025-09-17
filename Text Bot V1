@@ -1,0 +1,187 @@
+
+!pip install ollama langchain langchain-ollama faiss-cpu python-docx pdfplumber pdf2image pytesseract requests beautifulsoup4
+!pip install langchain-nomic
+
+import os
+import requests
+import warnings
+from bs4 import BeautifulSoup
+from docx import Document as DocxDocument
+import pdfplumber
+from pdf2image import convert_from_path
+import pytesseract
+
+from langchain.schema import Document
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+from langchain_community.chat_models import ChatOllama
+from langchain.chains import RetrievalQA
+from langchain_community.embeddings import OllamaEmbeddings
+
+# === Suppress noisy warnings ===
+warnings.filterwarnings("ignore", category=UserWarning, module="pdfminer")
+warnings.filterwarnings("ignore", category=UserWarning, module="PIL")
+
+# === Set Tesseract path ===
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+# === Folder path to scan for documents ===
+FOLDER_PATH = r"C:\Users\HarshTyagi\Desktop\New folder"
+
+# === Load embeddings from Ollama ===
+print("🔹 Loading local Nomic embeddings from Ollama...")
+embedding_model = OllamaEmbeddings(model="nomic-embed-text:latest")
+
+# === Functions ===
+def extract_links_from_docx(file_path):
+    """Extract hyperlinks from DOCX"""
+    try:
+        doc = DocxDocument(file_path)
+        links = []
+
+        # Visible URLs in text
+        for para in doc.paragraphs:
+            for word in para.text.split():
+                if word.startswith("http"):
+                    links.append(word.strip())
+
+        # Embedded hyperlinks
+        for rel in doc.part.rels.values():
+            if "hyperlink" in rel.reltype:
+                links.append(rel.target_ref)
+
+        return list(set(links))
+    except Exception as e:
+        print(f"⚠️ Error extracting links: {e}")
+        return []
+
+def fetch_web_content_as_document(url):
+    """Fetch webpage and convert to LangChain Document"""
+    try:
+        response = requests.get(url, timeout=10)
+        soup = BeautifulSoup(response.text, "html.parser")
+        text = soup.get_text(separator=" ", strip=True)
+        return Document(page_content=text[:3000], metadata={"source": url})
+    except Exception as e:
+        print(f"⚠️ Failed to fetch content from {url}: {e}")
+        return None
+
+def load_pdf(file_path):
+    """Load PDF with OCR fallback"""
+    try:
+        texts = []
+        with pdfplumber.open(file_path) as pdf:
+            for page_num, page in enumerate(pdf.pages):
+                try:
+                    text = page.extract_text()
+                except Exception:
+                    text = None
+                if text and text.strip():
+                    texts.append(text)
+                else:
+                    # OCR fallback (safe mode)
+                    try:
+                        images = convert_from_path(
+                            file_path,
+                            first_page=page_num + 1,
+                            last_page=page_num + 1,
+                            fmt="png",
+                            single_file=True  # avoids invalid float warnings
+                        )
+                        for image in images:
+                            ocr_text = pytesseract.image_to_string(image)
+                            texts.append(ocr_text)
+                    except Exception as e:
+                        print(f"⚠️ OCR failed on page {page_num+1}: {e}")
+        return Document(page_content="\n".join(texts)[:3000], metadata={"source": file_path})
+    except Exception as e:
+        print(f"❌ Failed to load PDF {file_path}: {e}")
+        return None
+
+def load_docx(file_path):
+    """Load DOCX and return LangChain Document"""
+    try:
+        doc = DocxDocument(file_path)
+        full_text = "\n".join([p.text for p in doc.paragraphs])
+        return Document(page_content=full_text[:3000], metadata={"source": file_path})
+    except Exception as e:
+        print(f"❌ Failed to load DOCX {file_path}: {e}")
+        return None
+
+def load_all_documents(folder_path):
+    """Load all PDFs and DOCX from folder and fetch web content from links"""
+    docs = []
+    for filename in os.listdir(folder_path):
+        path = os.path.join(folder_path, filename)
+        if filename.lower().endswith(".pdf"):
+            doc = load_pdf(path)
+            if doc:
+                docs.append(doc)
+                print(f"📄 Loaded PDF: {filename}")
+        elif filename.lower().endswith(".docx"):
+            doc = load_docx(path)
+            if doc:
+                docs.append(doc)
+                print(f"📄 Loaded DOCX: {filename}")
+                links = extract_links_from_docx(path)
+                for link in links:
+                    web_doc = fetch_web_content_as_document(link)
+                    if web_doc:
+                        docs.append(web_doc)
+                        print(f"🔗 Loaded web content: {link}")
+    return docs
+
+def suggest_followup_questions_llm(query, answer, llm):
+    """Generate intelligent follow-up questions using the LLM"""
+    prompt = f"""
+You are a helpful assistant. 
+The user asked: "{query}".
+You answered: "{answer}".
+
+Now suggest 3 highly relevant follow-up questions the user could ask next.
+Only return the questions as a bullet list.
+"""
+    try:
+        response = llm.invoke(prompt)
+        return response.content.strip()
+    except Exception as e:
+        print(f"⚠️ Failed to generate follow-ups: {e}")
+        return ""
+
+# === Step 1: Load all documents ===
+docs = load_all_documents(FOLDER_PATH)
+print(f"\n📄 Total documents loaded: {len(docs)}")
+
+# === Step 2: Split documents into chunks ===
+splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+chunks = splitter.split_documents(docs)
+print(f"📚 Total chunks: {len(chunks)}")
+
+# === Step 3: Embed chunks and create FAISS index ===
+faiss_index = FAISS.from_documents(chunks, embedding_model)
+print(f"✅ FAISS index created with {faiss_index.index.ntotal} vectors.")
+
+# === Step 4: Load LLM & Retrieval QA Chain ===
+llm = ChatOllama(model="llama3:latest", temperature=0.3)
+qa_chain = RetrievalQA.from_chain_type(llm=llm, retriever=faiss_index.as_retriever())
+
+# === Step 5: Interactive Q&A ===
+print("\n💬 Conversational QA (type 'exit' to quit)")
+while True:
+    query = input("\n❓ Ask a question: ").strip()
+    if query.lower() == "exit":
+        print("👋 Exiting...")
+        break
+
+    # Retrieve answer
+    answer = qa_chain.run(query)
+    print(f"\n🤖 Answer: {answer}")
+
+    # Show top chunks
+    top_chunks = faiss_index.similarity_search(query, k=3)
+    
+    # LLM-powered follow-up questions
+    suggestions = suggest_followup_questions_llm(query, answer, llm)
+    if suggestions:
+        print("\n💡 Suggested follow-up questions:")
+        print(suggestions)
