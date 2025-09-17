@@ -1,0 +1,328 @@
+!pip install langchain langchain-community langchain-ollama mysql-connector-python pandas ipython sqlalchemy tabulate
+
+
+from langchain_community.utilities import SQLDatabase
+from langchain_ollama import ChatOllama
+from langchain.prompts import PromptTemplate, FewShotPromptTemplate
+from sqlalchemy import text
+from datetime import datetime
+from IPython.display import display
+import pandas as pd
+import json
+import decimal
+
+# === CONFIGURATION ===
+DB_URI = "mysql+mysqlconnector://networkuser:rxb829GMZhjGm27vYEUf@35.154.239.144:3306/xi55_network"
+API_KEY = "secure-mcp-key"
+LOG_FILE = "notebook_query_logs.jsonl"
+
+# === COLUMN SCHEMA
+orders_column_str = """id, scancode, partner_scancode, customerid, consignor_id, shipperaddress, pickupaddress, billingaddress, recieveraddress, lmreceiveraddress, ioraddress, iec, shippingmethod, paymentmethod, terms, taxtype, purpose, shipmentreferences, exportreference, order_notes, status, all_status, service, destination_clearance, shippingcurrency, billing_currency, shippingestimates, shippingpricebeforediscount, shippingpriceafterdiscount, shippingdiscountamount, shippingdiscountpercentage, shippingrateperkg, provisional_charge_method, provisional_roundup_slab, final_charge_method, final_roundup_slab, final_shipping_rate, final_shipping_discount, grossweight, volumetricweight, finalgrossweight, finalvolumetricweight, chargeableweight, shipment_value_inr, remoteareasurcharge, deliveryareasurcharge, oversizesurcharge, overweightsurcharge, lineitemsurcharge, origin_customs_duty, destination_customs_duty, shippingpricewithsurcharges, finalamount, advanceamount, cgstrateforadvanceamount, cgstadvanceamount, sgstrateforadvanceamount, sgstadvanceamount, igstrateforadvanceamount, igstadvanceamount, advanceamountwithgst, pendingamount, cgstrateforpendingamount, cgstpendingamount, sgstrateforpendingamount, sgstpendingamount, igstrateforpendingamount, igstpendingamount, pendingamountwithgst, totalamount, cgsttotalamount, cgstratefortotalamount, sgstratefortotalamount, sgsttotalamount, igstratefortotalamount, igsttotalamount, totalamountwithgst, fobvalue, paymentid, paymentstatus, paiddate, isdocupload, master_docs_uploaded, created_on, modified_on, modified_by, currentnode, tonode, lmcarrier, lmshippingmethod, ispickedup, pickedupdate, ispcreceived, pcreceiveddate, ishubreceived, hubreceiveddate, dwsstatus, dwsdonedate, islmlabeldone, is_lm_manually_assigned, lmlabeldonedate, isreceivedindestination, receivedindestinationdate, iscancelled, isdelivered, confirmeddate, estimateddeliverydate, updated_eta, readyforpickupdate, outforpickupdate, pickupsuccessfulldate, pickupfaileddate, receivedatpickuplocationdate, acceptedatpickuplocationdate, connectedtohubdate, receivedathubdate, acceptedathubdate, atorigincustomsdate, onholdatorigincustomsdate, clearedatorigincustomsdate, connectedtogatewaycountrydate, arrivedatdestinationcountrydate, clearedatdestinationcustomsdate, onholdatdestinationcustomsdate, intransittolastmiledate, receivedatlastmilehubdate, outfordeliverydate, delivereddate, cancelleddate, lostdate, deliveryattempteddate, deliveryaddresschangeddate, deliverydelayeddate, returningtosenderdate, invoiceavailable, shippingbillstatus, shippingbillupdateddate, h_awb, departuredate, carriernumber, fobexchangerate, fobinrvalue, csbnumber, egmnumber, egmdate, pointofentry, lmpartner, previouslmcarrier, bbx_id, freight_charges, invoice_date, tat, lmlabelstatus, batch_id, final_charge_updated, cumulative_shipment_value, eta_message, initial_chargeable_weight, final_chargeable_weight, initial_weight_slab, final_weight_slab, wac_status, from_oms, serviceability_cost, recommended_lm_partner, ready_for_invoicing_date, invoicing_status, rate_version, market_place, opted_ior_service, active_brokers, source, batch_awb, batch_invoice_number, vat_number, eori_number, fm_manifest_scancode, xindus_assured, final_campaign_name, campaign_name, campaign_id, campaign_customer_id, is_fba, tags, b2b_shipment"""
+
+# === PROMPT: Crisp Optimized Instruction ===
+prefix = f"""
+You are a MySQL assistant. Use valid MySQL syntax.
+- 📌 Return Format:
+- Only output valid MySQL queries (no explanation, no formatting)
++ 📌 Return Format:
++ Respond only with raw MySQL query. Do NOT include markdown, explanation, or labels.
+🎯 INSTRUCTIONS:
+- For questions about "last X months", use: created_on >= CURDATE() - INTERVAL X MONTH
+- For aggregation by category, use GROUP BY
+- Use ROW_NUMBER() for top-N queries per group
+- Use alias names from the subqueries if it is available
+Available table:
+orders({orders_column_str})
+
+🎯 INSTRUCTIONS:
+
+📌 Field Synonyms:
+- "revenue" → use totalamount
+- "net weight" → use chargeableweight
+- "yield" → use SUM(totalamount) / NULLIF(SUM(chargeableweight), 0)
+- "product" → refers to shippingmethod
+- "Shipments" → refers to Scancode
+📌 Product Mapping (shippingmethod values):
+- AE = 'Xindus Xpress'
+- XL = 'Xindus Lite'
+- EB = 'BBX'
+- XB = 'Xpress Books'
+- XF = 'ECCF'
+- AN = 'Xpress B2B'
+
+
+📌 Status Mapping (status values):
+
+- "Delivered" → status = 'SHIPMENT_DELIVERED'
+- "Lost" → status IN ('SHIPMENT_LOST_OR_UNTRACEABLE', 'SHIPMENT_FORCED_LOST')
+
+❗ Never use status = 'Delivered' or status = 'Lost' directly.
+
+✅ Always map:
+- Delivered → exact string 'SHIPMENT_DELIVERED'
+- Lost → both 'SHIPMENT_LOST_OR_UNTRACEABLE' and 'SHIPMENT_FORCED_LOST' using IN (...)
+
+Example:
+-- ✅ Lost shipment count by product:
+SELECT 
+    shippingmethod,
+    COUNT(*) AS lost_shipments
+FROM orders
+WHERE status IN ('SHIPMENT_LOST_OR_UNTRACEABLE', 'SHIPMENT_FORCED_LOST')
+GROUP BY shippingmethod;
+
+
+🔄 If the question mentions product names like “Xindus Xpress”, map them to corresponding shippingmethod values.
+E.g.:
+- "Revenue in Xindus Xpress" → shippingmethod = 'AE'
+
+📌 Yield Rules:
+- ❌ NEVER write: totalamount / chargeableweight
+- ✅ ALWAYS use: SUM(totalamount) / NULLIF(SUM(chargeableweight), 0)
+- ✅ When asked for yield, also include SUM(totalamount) as revenue and SUM(chargeableweight) as net weight
+
+📌 Grouping Rules:
+- ❌ Do NOT group by raw created_on
+- ✅ Use:
+  - WEEK(created_on) → weekly
+  - MONTH(created_on) → monthly
+  - DATE_FORMAT(created_on, '%Y-%m') → monthly string
+  - DATE(created_on) → daily
+    - To find customers who used multiple products in a period, use COUNT(DISTINCT shippingmethod) in HAVING clause.
+
+
+📌 JSON Field Extraction (Only for shipper/receiver address):
+- Extract only: name, country, state, city
+- Use:
+  - JSON_UNQUOTE(JSON_EXTRACT(recieveraddress, '$.country')) AS country
+  - JSON_UNQUOTE(JSON_EXTRACT(shipperaddress, '$.state')) AS shipper_state
+- ❌ NEVER extract numeric or product fields from JSON
+
+📌 Subqueries:
+- Use subqueries if needed for filtering, aggregation, or date comparisons
+
+📌 Return Format:
+- Only output valid MySQL queries (no explanation, no formatting)
+
+📌 Key Examples:
+
+-- ✅ Product-wise weekly revenue:
+SELECT 
+    shippingmethod, 
+    WEEK(created_on) AS week, 
+    SUM(totalamount) AS revenue
+FROM orders
+WHERE MONTH(created_on) = 7 AND YEAR(created_on) = 2025
+GROUP BY shippingmethod, WEEK(created_on);
+
+-- ✅ Yield by product:
+SELECT 
+    shippingmethod,
+    SUM(totalamount) AS revenue,
+    SUM(chargeableweight) AS net_weight,
+    SUM(totalamount) / NULLIF(SUM(chargeableweight), 0) AS yield
+FROM orders
+GROUP BY shippingmethod;
+
+-- ✅ Extract receiver country:
+SELECT 
+    JSON_UNQUOTE(JSON_EXTRACT(recieveraddress, '$.country')) AS country,
+    COUNT(*) AS shipments
+FROM orders
+GROUP BY country;
+"""
+
+# === EXAMPLES ===
+examples = [
+    {
+        "question": "How many customers have not created any shipments since last 30 days",
+        "sql": """
+SELECT COUNT(*) AS inactive_customers
+FROM (
+    SELECT customerid
+    FROM orders
+    GROUP BY customerid
+    HAVING MAX(created_on) < DATE_SUB(CURDATE(), INTERVAL 30 DAY)
+) AS sub;
+""".strip()
+    },
+    {
+        "question": "What is the revenue of Xindus Xpress last week",
+    "sql": """
+SELECT 
+    SUM(totalamount) AS revenue
+FROM orders
+WHERE 
+    shippingmethod = 'AE'
+    AND WEEK(created_on) = WEEK(CURDATE()) - 1
+    AND YEAR(created_on) = YEAR(CURDATE());
+""".strip()
+    },
+    {
+        "question": "What is the revenue of Xindus Xpress last month",
+    "sql": """
+SELECT 
+    SUM(totalamount) AS revenue
+FROM orders
+WHERE 
+    shippingmethod = 'AE'
+    AND month(created_on) = month(CURDATE()) - 1
+    AND YEAR(created_on) = YEAR(CURDATE());
+""".strip()
+    },
+    {
+        "question": "How many shipments were created in the last 7 days?",
+        "sql": """
+SELECT COUNT(*) AS recent_shipments
+FROM orders
+WHERE created_on >= DATE_SUB(CURDATE(), INTERVAL 7 DAY);
+""".strip()
+    },
+    {
+    "question": "Give the top 1 customer for each product in terms of revenue in june 2025",
+    "sql": """
+SELECT customerid, shippingmethod, totalamount
+FROM (
+    SELECT 
+        customerid,
+        shippingmethod,
+        SUM(totalamount) AS totalamount,
+        ROW_NUMBER() OVER (
+            PARTITION BY shippingmethod 
+            ORDER BY SUM(totalamount) DESC
+        ) AS rn
+    FROM orders
+    WHERE 
+        MONTH(created_on) = 6
+        AND YEAR(created_on) = 2025
+    GROUP BY customerid, shippingmethod
+) AS ranked
+WHERE rn =1;
+""".strip()
+},{
+    "question": "Count of customers which transact in Xindus Xpress and BBX both in June 2025",
+    "sql": """
+SELECT COUNT(*) AS customers_with_both_products
+FROM (
+    SELECT customerid
+    FROM orders
+    WHERE 
+        shippingmethod IN ('AE', 'EB')
+        AND MONTH(created_on) = 6
+        AND YEAR(created_on) = 2025
+    GROUP BY customerid
+    HAVING COUNT(DISTINCT shippingmethod) = 2
+) AS sub;
+""".strip()
+}
+
+]
+
+example_prompt = PromptTemplate(
+    input_variables=["question", "sql"],
+    template="Question: {question}\nSQL: {sql}"
+)
+
+sql_prompt = FewShotPromptTemplate(
+    examples=examples,
+    example_prompt=example_prompt,
+    prefix=prefix,
+    suffix="Question: {question}",
+    input_variables=["question"]
+)
+
+print("🔗 Connecting to MySQL...")
+db = SQLDatabase.from_uri(DB_URI, include_tables=["orders"])
+print("✅ LangChain SQLDatabase initialized.")
+
+def load_llm(model="llama3", temperature=0.2):
+    print(f"🧠{model} :Is Thinking....")
+    return ChatOllama(model=model, temperature=temperature)
+
+def get_sql_query(question, model="llama3"):
+    llm = load_llm(model)
+    chain = sql_prompt | llm
+    result = chain.invoke({"question": question})
+    sql_text = result.content.strip()
+
+    # Clean up unwanted LLM output
+    if "```" in sql_text:
+        # Extract text between triple backticks
+        sql_text = sql_text.split("```")[1]
+        if sql_text.strip().lower().startswith("sql"):
+            sql_text = sql_text.strip()[3:]  # remove 'sql'
+    elif sql_text.lower().startswith("sql:"):
+        sql_text = sql_text[4:].strip()
+    elif "SELECT" in sql_text.upper():
+        # crude fallback: find first SELECT onwards
+        sql_text = sql_text[sql_text.upper().find("SELECT"):]
+
+    return sql_text.strip()
+
+
+def run_sql_query(query_text):
+    try:
+        engine = db._engine
+        with engine.connect() as conn:
+            result_proxy = conn.execute(text(query_text))
+            column_names = result_proxy.keys()
+            rows = result_proxy.fetchall()
+            return pd.DataFrame(rows, columns=column_names)
+    except Exception as e:
+        return f"❌ SQL Execution Error: {e}"
+
+def convert_for_json(obj):
+    if isinstance(obj, decimal.Decimal):
+        return float(obj)
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    return str(obj)
+
+def ask_question_verbose(question, model="llama3", api_key="secure-mcp-key"):
+    if api_key != API_KEY:
+        print("🚫 Invalid API Key")
+        return
+
+    try:
+        print(f"\n❓ Question: {question}")
+        sql = get_sql_query(question, model)
+        print(f"\n🧾 Generated SQL:\n{sql}")
+        result_df = run_sql_query(sql)
+
+        if isinstance(result_df, pd.DataFrame):
+            display(result_df)
+        else:
+            print(result_df)
+
+        # 🧠 Format result for summary
+        result_text = ""
+        if isinstance(result_df, pd.DataFrame) and not result_df.empty:
+            result_text = result_df.head(5).to_markdown(index=False)
+        else:
+            result_text = str(result_df)
+
+        # 🔄 Log full result
+        answer_serialized = (
+            result_df.to_dict(orient="records")
+            if isinstance(result_df, pd.DataFrame)
+            else str(result_df)
+        )
+        if isinstance(answer_serialized, list):
+            answer_serialized = [
+                {k: convert_for_json(v) for k, v in row.items()}
+                for row in answer_serialized
+            ]
+
+        log_entry = {
+            "timestamp": str(datetime.now()),
+            "question": question,
+            "sql_query": sql,
+            "answer": answer_serialized,
+            "model": model 
+        }
+
+        with open(LOG_FILE, "a") as f:
+            f.write(json.dumps(log_entry) + "\n")
+
+    except Exception as e:
+        print(f"❌ Error: {e}")
