@@ -1,0 +1,166 @@
+# 📦 Install required packages (run only once per environment)
+!pip install pandas openpyxl faiss-cpu langchain langchain-ollama tiktoken
+!pip install -U langchain-huggingface
+
+
+import os
+import pandas as pd
+import json
+from datetime import datetime
+from langchain_ollama import OllamaEmbeddings, OllamaLLM
+from langchain_community.vectorstores import FAISS
+
+# === Paths ===
+hts_path = r"C:\Users\HarshTyagi\Downloads\Htsdata.xlsx"
+hsn_path = r"C:\Users\HarshTyagi\Downloads\HSN_SAC.xlsx"
+cached_hts_vector_path = "faiss_hts_store"
+cached_hsn_vector_path = "faiss_hsn_store"
+response_log_path = "classification_responses.jsonl"
+
+# === Columns detection (adjust if needed) ===
+hts_code_col = "HTS Number"
+hts_desc_col = "Description"
+hsn_code_col = "HSN_CD"
+hsn_desc_col = "HSN_Description"
+
+# === Load embeddings & FAISS ===
+embeddings = OllamaEmbeddings(model="nomic-embed-text")
+print("🔄 Loading FAISS indexes...")
+vs_hts = FAISS.load_local(cached_hts_vector_path, embeddings, allow_dangerous_deserialization=True)
+vs_hsn = FAISS.load_local(cached_hsn_vector_path, embeddings, allow_dangerous_deserialization=True)
+print("✅ FAISS stores loaded successfully!")
+
+# === Load raw data ===
+df_hts = pd.read_excel(hts_path)
+df_hts.columns = df_hts.columns.str.strip()
+df_hsn = pd.read_excel(hsn_path)
+df_hsn.columns = df_hsn.columns.str.strip()
+df_hsn[hsn_code_col] = df_hsn[hsn_code_col].astype(str)
+
+# === Initialize LLM ===
+llm = OllamaLLM(model="llama3", verbose=True)
+
+# === Helper: Extract digits from HTS/HSN code ===
+def extract_structure(code: str):
+    code = "".join(filter(str.isdigit, str(code)))
+    return {
+        "chapter": code[:4] if len(code) >= 4 else None,   # first 4 digits
+        "heading": code[:6] if len(code) >= 6 else None,   # first 6 digits
+        "hsn8": code[:8] if len(code) >= 8 else code,      # first 8 digits
+        "full": code
+    }
+
+# === Mapping Function ===
+def map_hts_to_hsn(hts_code_or_desc: str):
+    reasoning_parts = []
+
+    if hts_code_or_desc.isdigit():
+        struct = extract_structure(hts_code_or_desc)
+        reasoning_parts.append(f"Input HTS code: {struct['full']}")
+
+        # Step 1: Locate HTS chapter description
+        hts_match = df_hts[df_hts[hts_code_col].astype(str).str.startswith(struct["chapter"])]
+        hts_desc_list = hts_match[hts_desc_col].head(3).tolist() if not hts_match.empty else []
+        hts_desc_text = "; ".join(hts_desc_list) if hts_desc_list else "No HTS description found."
+        reasoning_parts.append(f"HTS Chapter {struct['chapter']}: {hts_desc_text}")
+
+        # Step 2: Exact 8-digit HSN
+        hsn_match = df_hsn[df_hsn[hsn_code_col] == struct["hsn8"]]
+        if not hsn_match.empty:
+            best_match = hsn_match.iloc[0]
+            reasoning_parts.append(f"Exact 8-digit HSN {struct['hsn8']} found.")
+            return {
+                "HSN_Code": best_match[hsn_code_col],
+                "HSN_Description": best_match[hsn_desc_col],
+                "Confidence": "High",
+                "Reasoning": " ".join(reasoning_parts)
+            }
+
+        # Step 3: Fallback to heading (6-digit) using LLM
+        fallback_heading_match = df_hsn[df_hsn[hsn_code_col].str.startswith(struct["heading"])]
+        if not fallback_heading_match.empty:
+            fallback_heading = fallback_heading_match.iloc[0]
+            reasoning_parts.append(f"No exact 8-digit HSN. Fallback heading {struct['heading']} found.")
+
+            prompt = f"""
+You are an expert in Indian HSN classification.
+
+Input HTS code: {struct['full']}
+HTS Description: {hts_desc_text}
+Fallback HSN heading: {fallback_heading[hsn_code_col]} - {fallback_heading[hsn_desc_col]}
+
+Based on this, return the correct 8-digit HSN code and full HSN description.
+Respond in JSON only with keys: HSN_Code, HSN_Description, Confidence, Reasoning
+"""
+            try:
+                llm_response = llm.invoke(prompt).strip()
+                if not llm_response.startswith("{"):
+                    llm_response = llm_response[llm_response.find("{"):]
+                return json.loads(llm_response)
+            except Exception as e:
+                print(f"⚠️ LLM failed: {e}")
+                return {
+                    "HSN_Code": fallback_heading[hsn_code_col],
+                    "HSN_Description": fallback_heading[hsn_desc_col],
+                    "Confidence": "Medium",
+                    "Reasoning": "LLM failed, fallback to 6-digit heading."
+                }
+
+        # Step 4: Chapter-level fallback
+        chapter_match = df_hsn[df_hsn[hsn_code_col].str.startswith(struct["chapter"][:4])]
+        if not chapter_match.empty:
+            best_match = chapter_match.iloc[0]
+            reasoning_parts.append(f"No heading match. Fallback to chapter {struct['chapter'][:4]}.")
+            return {
+                "HSN_Code": best_match[hsn_code_col],
+                "HSN_Description": best_match[hsn_desc_col],
+                "Confidence": "Low",
+                "Reasoning": " ".join(reasoning_parts)
+            }
+
+        return {
+            "HSN_Code": None,
+            "HSN_Description": None,
+            "Confidence": "Low",
+            "Reasoning": " ".join(reasoning_parts) + " No HSN match found."
+        }
+
+    else:
+        # Description input → semantic search
+        docs = vs_hsn.similarity_search(hts_code_or_desc, k=1)
+        if docs:
+            candidate = docs[0]
+            reasoning_parts.append("Input is description. Used semantic similarity with FAISS.")
+            return {
+                "HSN_Code": candidate.metadata.get(hsn_code_col),
+                "HSN_Description": candidate.page_content,
+                "Confidence": "Medium",
+                "Reasoning": " ".join(reasoning_parts)
+            }
+        return {"HSN_Code": None, "HSN_Description": None, "Confidence": "Low",
+                "Reasoning": "Description search gave no match."}
+
+# === Logging ===
+def log_response(input_val, result):
+    with open(response_log_path, "a", encoding="utf-8") as f:
+        log_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "input": input_val,
+            "output": result
+        }
+        f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+
+# === Interactive Mode ===
+print("\n🚀 HTS → HSN Interactive Classifier")
+print("Type 'exit' to quit.\n")
+
+while True:
+    user_in = input("❓ Enter HTS code or description: ").strip()
+    if user_in.lower() == "exit":
+        break
+
+    result = map_hts_to_hsn(user_in)
+    print("\n📊 Suggested HSN Mapping:")
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    log_response(user_in, result)
+    print("✅ Result saved.\n")
