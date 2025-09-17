@@ -1,0 +1,165 @@
+# 📦 Install required packages (run only once per environment)
+!pip install pandas openpyxl faiss-cpu langchain langchain-ollama tiktoken
+!pip install -U langchain-huggingface
+
+import os
+import pandas as pd
+import numpy as np
+from langchain_ollama import OllamaEmbeddings
+from langchain.vectorstores import FAISS
+from langchain.text_splitter import CharacterTextSplitter
+from langchain_community.llms import Ollama
+from datetime import datetime
+import pickle
+import json
+import re
+
+# === Paths ===
+classification_path = r"C:\Users\HarshTyagi\Downloads\Xindus Classification Results.xlsx"
+hsn_path = r"C:\Users\HarshTyagi\Downloads\HSN_SAC.xlsx"
+class_sheet = "Gaia Classification Results"
+
+cached_class_vector_path = "classification_faiss"
+cached_hsn_vector_path = "hsn_faiss"
+response_log_path = "classification_responses.jsonl"
+
+# === Load and clean classification file ===
+df_train = pd.read_excel(classification_path, sheet_name=class_sheet)
+df_train.columns = df_train.columns.str.replace(r"[\n\r\t]", "", regex=True).str.strip()
+print("\u2705 Training columns:", df_train.columns.tolist())
+
+# === Build training corpus ===
+df_train["training_text"] = (
+    "Reasoning: " + df_train["Classification Reasoning"].fillna("") + "\n"
+    + "Available: " + df_train["Available Information"].fillna("") + "\n"
+    + "Suggested Description: " + df_train["Suggested Description"].fillna("")
+)
+training_texts = df_train["training_text"].tolist()
+
+# === Text splitter ===
+splitter = CharacterTextSplitter(chunk_size=512, chunk_overlap=50)
+training_docs = splitter.create_documents(training_texts)
+
+# === Load HSN master ===
+df_hsn = pd.read_excel(hsn_path)
+df_hsn.columns = df_hsn.columns.str.strip()
+print("\u2705 HSN columns:", df_hsn.columns.tolist())
+
+# === Embeddings ===
+embedding = OllamaEmbeddings(model="nomic-embed-text")
+
+# === Caching classification vector store ===
+if os.path.exists(cached_class_vector_path):
+    db_class = FAISS.load_local(cached_class_vector_path, embedding, allow_dangerous_deserialization=True)
+else:
+    db_class = FAISS.from_documents(training_docs, embedding)
+    db_class.save_local(cached_class_vector_path)
+
+# === Caching HSN vector store ===
+hsn_descriptions = df_hsn["HSN_Description"].fillna("").astype(str).tolist()
+hsn_docs = splitter.create_documents(hsn_descriptions)
+
+if os.path.exists(cached_hsn_vector_path):
+    db_hsn = FAISS.load_local(cached_hsn_vector_path, embedding, allow_dangerous_deserialization=True)
+else:
+    db_hsn = FAISS.from_documents(hsn_docs, embedding)
+    db_hsn.save_local(cached_hsn_vector_path)
+
+# === LLM ===
+llm = Ollama(model="llama3")
+
+# === Matching function ===
+def match_hsn_code(description):
+    docs = db_hsn.similarity_search(description, k=5)
+    top_match = docs[0].page_content
+    matched_code = df_hsn[df_hsn["HSN_Description"] == top_match]["HSN_CD"].values
+    return matched_code[0] if len(matched_code) > 0 else None, top_match
+
+# === Inference loop ===
+while True:
+    raw_input_desc = input("\n❓ Enter product description (or type 'exit'):  ").strip()
+    if raw_input_desc.lower() == "exit":
+        break
+
+    relevant_docs = db_class.similarity_search(raw_input_desc, k=3)
+    context = "\n---\n".join([doc.page_content for doc in relevant_docs])
+
+    prompt = f"""
+You are a customs classification assistant.
+Based on the reasoning and examples below, rewrite the product description to be CBP-compliant, extract any missing details, and return the most accurate classification.
+
+Return:
+- A rewritten CBP-compliant description
+- A 65-character CBP-compliant summary for shipping labels
+- A list of missing info if any
+- The best matching HSN and HTS codes (in format "HSN: xxxx | HTS: xxxx.xx.xxxx")
+- The HSN description
+
+---
+Examples:
+{context}
+---
+
+Input: {raw_input_desc}
+
+Return only valid JSON object as output. Use the following keys:
+{{
+  "cbp_description": "...",
+  "summary_description": "...",
+  "missing_info": ["...", "..."],
+  "final_hsn_code": "HSN: .... | HTS: ....",
+  "final_hsn_description": "..."
+}}
+"""
+
+    try:
+        response_text = llm.invoke(prompt).strip()
+        print("\n✅ Model Response:", response_text)
+
+        match = re.search(r'\{[\s\S]*\}', response_text)
+        if match:
+            data = json.loads(match.group())
+        else:
+            raise ValueError("No JSON object found in the model response.")
+
+        # Check if LLM provided both final_hsn_code and final_hsn_description
+        model_provided_code = bool(data.get("final_hsn_code") and data.get("final_hsn_description"))
+
+        if model_provided_code:
+            data["source"] = "model"
+        else:
+            # Use FAISS vector fallback
+            matched_code, matched_desc = match_hsn_code(data.get("cbp_description"))
+            if matched_code:
+                hts_code = f"{matched_code[:4]}.{matched_code[4:6]}.{matched_code[6:].zfill(4)}"
+                data["final_hsn_code"] = f"HSN: {matched_code} | HTS: {hts_code}"
+                data["final_hsn_description"] = matched_desc
+                data["source"] = "vector_fallback"
+            else:
+                data["source"] = "unknown"
+
+        data_to_log = {
+            "input": raw_input_desc,
+            "timestamp": datetime.now().isoformat(),
+            "response": data
+        }
+        with open(response_log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(data_to_log) + "\n")
+
+        # === Output ===
+        print("\n🟩 CBP Description:", data["cbp_description"])
+        print("🟩 Summary (<65 chars):", data["summary_description"])
+        print("🟩 Final HSN Code:", data["final_hsn_code"])
+        print("🟩 HSN Description:", data["final_hsn_description"])
+        print("🟥 Missing Info:", ", ".join(data["missing_info"]))
+        print("🟦 Source:", data.get("source", "unknown"))
+
+    except json.JSONDecodeError as json_err:
+        print("⚠️ JSON decode error:", json_err)
+        print("⚠️ Raw response:", response_text)
+        continue
+
+    except Exception as e:
+        print("⚠️ Unexpected error:", e)
+        print("⚠️ Raw response:", response_text)
+        continue
