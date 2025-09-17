@@ -1,0 +1,115 @@
+!pip install pandas anthropic openpyxl
+
+import pandas as pd
+import anthropic
+import time
+
+# === File Paths ===
+hsn_data_path = r"C:\Users\HarshTyagi\Desktop\HSN_New.xlsx"
+input_file = r"C:\Users\HarshTyagi\Desktop\HTS Input.xlsx"
+output_file = r"C:\Users\HarshTyagi\Desktop\HTS_Input_Updated.xlsx"
+
+# === Load Indian HSN dataset ===
+df_hsn = pd.read_excel(hsn_data_path, dtype=str)
+df_hsn.columns = df_hsn.columns.str.strip().str.lower()
+df_hsn = df_hsn.rename(columns={"hsn_cd": "hsn_code", "hsn_description": "description"})
+
+# === Load Input File ===
+df_input = pd.read_excel(input_file, dtype=str)
+
+# === Setup Claude Client ===
+client = anthropic.Anthropic(api_key="XXX")
+
+# === Function to get HSN from Claude ===
+def get_correct_hsn(hts_code, heading_desc, customer_desc, cbp_desc):
+    if pd.isna(hts_code):
+        return "No HTS"
+    
+    base_code = hts_code.replace(".", "")[:6]  # First 6 digits
+    candidates = df_hsn[df_hsn['hsn_code'].str.startswith(base_code)]
+    if candidates.empty:
+        return "Not Found"
+    
+    prompt = f"""
+    You are a trade compliance expert. 
+    Given the following inputs, select the most accurate 8-digit Indian HSN code 
+    from the provided candidate list. 
+
+    Inputs:
+    - HTS Code (US): {hts_code}
+    - Chapter/Heading Description: {heading_desc}
+    - Original Customer Description: {customer_desc}
+    - CBP-Compliant Description: {cbp_desc}
+
+    Candidate Indian HSN Codes:
+    {candidates.to_string(index=False)}
+
+    Return only the best matching 8-digit HSN code (nothing else).
+    """
+    
+    try:
+        response = client.messages.create(
+            model="claude-opus-4-20250514",  # ✅ latest stable model
+            max_tokens=50,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.content[0].text.strip()
+    except Exception as e:
+        return f"Error: {e}"
+
+# === Process Each Row ===
+results = []
+descriptions = []
+
+for idx, row in df_input.iterrows():
+    hts_code = row.get("best_guess_code", "")
+    customer_desc = row.get("description", "")
+    cbp_desc = row.get("suggested_description", "")
+    heading_desc = row.get("description_heading", "")
+    
+    print(f"Processing row {idx+1}/{len(df_input)}: HTS={hts_code}")
+    hsn = get_correct_hsn(hts_code, heading_desc, customer_desc, cbp_desc)
+    results.append(hsn)
+
+    # ✅ Build hierarchical context from HSN master
+    if hsn and hsn.isdigit():
+        hierarchy = df_hsn[df_hsn["hsn_code"].str.startswith(hsn[:2])]
+        context_text = "\n".join([
+            f"{r['hsn_code']}: {r['description']}"
+            for _, r in hierarchy.iterrows()
+        ])
+
+        # Ask Claude to rewrite as full description
+        prompt_desc = f"""
+        You are a trade compliance expert.
+        Given this HSN hierarchy (chapter, heading, subheading):
+
+        {context_text}
+
+        And the final selected HSN code: {hsn}
+
+        Write the full official description for this HSN by combining
+        the chapter, heading, and subheading descriptions in a
+        natural way. Output only the description text, nothing else.
+        """
+
+        response = client.messages.create(
+            model="claude-opus-4-20250514",
+            max_tokens=100,
+            messages=[{"role": "user", "content": prompt_desc}]
+        )
+
+        descriptions.append(response.content[0].text.strip())
+    else:
+        descriptions.append("Not Found")
+
+    time.sleep(1)
+
+
+# === Add Results to DataFrame ===
+df_input["correct_hsn"] = results
+df_input["correct_hsn_description"] = descriptions
+
+# === Save Updated File ===
+df_input.to_excel(output_file, index=False)
+print(f"✅ Updated file saved at: {output_file}")
